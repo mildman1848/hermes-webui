@@ -88,11 +88,84 @@ def _resolve_cookie_name() -> str:
 _SESSIONS_FILE = STATE_DIR / '.sessions.json'
 
 
-def _load_sessions() -> dict[str, float]:
-    """Load persisted sessions from STATE_DIR, pruning expired entries.
+def _default_owner() -> str:
+    return os.getenv('HERMES_WEBUI_DEFAULT_USER', 'philipp').strip().lower() or 'philipp'
 
-    Returns an empty dict on any read or parse error so startup is never
-    blocked by a corrupt or missing sessions file.
+
+def normalize_username(username: str | None) -> str:
+    raw = str(username or '').strip().lower()
+    if '\\' in raw:
+        raw = raw.rsplit('\\', 1)[-1]
+    if '/' in raw:
+        raw = raw.rsplit('/', 1)[-1]
+    if '@' in raw:
+        raw = raw.split('@', 1)[0]
+    return ''.join(c for c in raw if c.isalnum() or c in {'_', '-'})
+
+
+_USERS_FILE = STATE_DIR / '.users.json'
+
+
+def _load_users() -> dict:
+    try:
+        if _USERS_FILE.exists():
+            data = json.loads(_USERS_FILE.read_text(encoding='utf-8'))
+            if isinstance(data, dict):
+                users = data.get('users', data)
+                if isinstance(users, dict):
+                    return users
+    except Exception as exc:
+        logger.debug('Failed to load WebUI users: %s', exc)
+    return {}
+
+
+def configured_usernames() -> list[str]:
+    return sorted(_load_users().keys())
+
+
+def is_multi_user_auth_enabled() -> bool:
+    return bool(_load_users())
+
+
+def verify_user_password(username: str | None, plain: str) -> tuple[bool, str | None]:
+    user = normalize_username(username)
+    if not user:
+        return False, None
+    users = _load_users()
+    entry = users.get(user)
+    if not isinstance(entry, dict):
+        return False, None
+    expected = str(entry.get('password_hash') or '')
+    if not expected:
+        return False, None
+    return hmac.compare_digest(_hash_password(str(plain or '')), expected), user
+
+
+def _session_record(expiry: float, username: str | None = None) -> dict:
+    return {'expires': float(expiry), 'user': normalize_username(username) or _default_owner()}
+
+
+def _session_expiry(record) -> float | None:
+    if isinstance(record, (int, float)):
+        return float(record)
+    if isinstance(record, dict):
+        exp = record.get('expires', record.get('expiry'))
+        if isinstance(exp, (int, float)):
+            return float(exp)
+    return None
+
+
+def _session_user(record) -> str:
+    if isinstance(record, dict):
+        return normalize_username(record.get('user')) or _default_owner()
+    return _default_owner()
+
+
+def _load_sessions() -> dict:
+    """Load persisted auth sessions from STATE_DIR, pruning expired entries.
+
+    Supports the legacy token -> expiry shape and the multi-user token ->
+    {expires, user} shape. Legacy sessions are attributed to the default owner.
     """
     try:
         if _SESSIONS_FILE.exists():
@@ -100,8 +173,15 @@ def _load_sessions() -> dict[str, float]:
             if not isinstance(data, dict):
                 raise ValueError('malformed sessions file — expected dict')
             now = time.time()
-            return {t: exp for t, exp in data.items()
-                    if isinstance(t, str) and isinstance(exp, (int, float)) and exp > now}
+            out = {}
+            users = {}
+            for token, record in data.items():
+                exp = _session_expiry(record)
+                if isinstance(token, str) and exp and exp > now:
+                    out[token] = float(exp)
+                    users[token] = _session_user(record)
+            globals()['_loaded_session_users'] = users
+            return out
     except Exception as e:
         logger.debug("Failed to load sessions file, starting fresh: %s", e)
     return {}
@@ -117,8 +197,14 @@ def _save_sessions(sessions: dict[str, float]) -> None:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=STATE_DIR, suffix='.sessions.tmp')
         try:
+            persisted = {}
+            session_users = globals().get('_session_users') or {}
+            for token, expiry in sessions.items():
+                exp = _session_expiry(expiry)
+                if exp:
+                    persisted[token] = _session_record(exp, session_users.get(token))
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                json.dump(sessions, f)
+                json.dump(persisted, f)
             os.chmod(tmp, 0o600)
             os.replace(tmp, _SESSIONS_FILE)
         except Exception:
@@ -131,8 +217,12 @@ def _save_sessions(sessions: dict[str, float]) -> None:
         logger.debug("Failed to persist sessions: %s", e)
 
 
-# Active sessions: token -> expiry timestamp (persisted across restarts via STATE_DIR)
+# Active sessions: token -> expiry timestamp (persisted across restarts via STATE_DIR).
+# Keep this legacy shape intentionally: tests and integrations inspect
+# ``_sessions`` directly as token -> float. User ownership is tracked in a
+# parallel map and persisted as token -> {expires, user} on disk.
 _sessions = _load_sessions()
+_session_users = globals().pop('_loaded_session_users', {})
 _SESSIONS_LOCK = threading.Lock()
 
 # ── Login rate limiter ──────────────────────────────────────────────────────
@@ -379,8 +469,8 @@ def are_passkeys_enabled() -> bool:
 
 
 def is_auth_enabled() -> bool:
-    """True if password auth or passkey-only auth is configured."""
-    return is_password_auth_enabled() or are_passkeys_enabled()
+    """True if single-password, multi-user, or passkey-only auth is configured."""
+    return is_multi_user_auth_enabled() or is_password_auth_enabled() or are_passkeys_enabled()
 
 
 def verify_password(plain: str) -> bool:
@@ -414,11 +504,12 @@ def verify_password(plain: str) -> bool:
     return False
 
 
-def create_session() -> str:
+def create_session(username: str | None = None) -> str:
     """Create a new auth session. Returns signed cookie value."""
     token = secrets.token_hex(32)
     with _SESSIONS_LOCK:
         _sessions[token] = time.time() + _resolve_session_ttl()
+        _session_users[token] = normalize_username(username) or _default_owner()
         _save_sessions(_sessions)
     sig = hmac.new(_signing_key(), token.encode(), hashlib.sha256).hexdigest()
     return f"{token}.{sig}"
@@ -428,10 +519,11 @@ def _prune_expired_sessions():
     """Remove all expired session entries to prevent unbounded memory growth."""
     now = time.time()
     with _SESSIONS_LOCK:
-        expired = [t for t, exp in _sessions.items() if now > exp]
+        expired = [t for t, record in _sessions.items() if (_session_expiry(record) or 0) <= now]
         if expired:
             for token in expired:
                 _sessions.pop(token, None)
+                _session_users.pop(token, None)
             _save_sessions(_sessions)
 
 
@@ -451,9 +543,11 @@ def verify_session(cookie_value: str) -> bool:
     if not valid:
         return False
     with _SESSIONS_LOCK:
-        expiry = _sessions.get(token)
+        record = _sessions.get(token)
+        expiry = _session_expiry(record)
         if not expiry or time.time() > expiry:
             _sessions.pop(token, None)
+            _session_users.pop(token, None)
             _save_sessions(_sessions)
             return False
     return True
@@ -514,6 +608,22 @@ def verify_profile_cookie_value(cookie_value: str, session_cookie_value: str | N
     return None
 
 
+def username_for_cookie(cookie_value: str | None) -> str | None:
+    if not cookie_value or not verify_session(cookie_value):
+        return None
+    token = _session_token_from_cookie_value(cookie_value)
+    if not token:
+        return None
+    with _SESSIONS_LOCK:
+        if token not in _sessions:
+            return None
+        return normalize_username(_session_users.get(token)) or _default_owner()
+
+
+def current_username(handler) -> str | None:
+    return username_for_cookie(parse_cookie(handler))
+
+
 def csrf_token_for_session(cookie_value: str) -> str | None:
     """Return the CSRF token bound to an authenticated WebUI session.
 
@@ -544,6 +654,7 @@ def invalidate_session(cookie_value) -> None:
         with _SESSIONS_LOCK:
             if token in _sessions:
                 _sessions.pop(token, None)
+                _session_users.pop(token, None)
                 _save_sessions(_sessions)
 
 

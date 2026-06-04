@@ -141,3 +141,24 @@ def test_truncate_zero_keep_count_clears_transcript(monkeypatch, tmp_path):
     loaded = Session.load("trunc_zero")
     assert loaded is not None
     assert loaded.messages == []
+
+
+def test_truncate_rejects_sessions_owned_by_another_webui_user(monkeypatch, tmp_path):
+    import api.routes as routes
+
+    Session = _make_session(monkeypatch, tmp_path, "trunc_other_owner")
+    loaded = Session.load("trunc_other_owner")
+    assert loaded is not None
+    loaded.owner = "philipp"
+    loaded.save()
+
+    monkeypatch.setattr(routes, "_current_webui_user", lambda handler: "jacky")
+
+    captured = _post_truncate(monkeypatch, "trunc_other_owner", 1)
+
+    assert captured["status"] == 404
+    assert "Session not found" in captured["payload"]["error"]
+
+    reloaded = Session.load("trunc_other_owner")
+    assert reloaded is not None
+    assert [m["content"] for m in reloaded.messages] == ["first", "reply first", "second"]

@@ -487,6 +487,7 @@ def _webui_ephemeral_system_prompt(
     personality_prompt: Optional[str],
     surface_context: Optional[dict] = None,
     config_data: Optional[dict] = None,
+    owner: str | None = None,
 ) -> str:
     """Build WebUI-only runtime instructions that are not persisted to history."""
     parts = []
@@ -495,6 +496,9 @@ def _webui_ephemeral_system_prompt(
     surface_prompt = _webui_surface_context_prompt(surface_context)
     if surface_prompt:
         parts.append(surface_prompt)
+    user_context_prompt = _webui_household_user_context_prompt(owner)
+    if user_context_prompt:
+        parts.append(user_context_prompt)
     parts.append(_WEBUI_PROGRESS_PROMPT)
     delivery_prompt = _webui_delivery_context_prompt(config_data)
     if delivery_prompt:
@@ -821,14 +825,42 @@ def _webui_delivery_context_prompt(config_data: Optional[dict] = None) -> str:
     return "\n".join(lines)
 
 
-def _prefill_messages_with_webui_context(prefill_context: dict, config_data: Optional[dict] = None) -> list[dict]:
-    """Combine recall prefill with WebUI session context.
+def _webui_household_user_context_prompt(owner: str | None) -> str:
+    """Return per-login identity guidance for shared household WebUI sessions."""
+    user = str(owner or "").strip().lower()
+    if not user:
+        return ""
+    lines = [
+        "## WebUI Authenticated User Context",
+        "",
+        f"**Authenticated WebUI user:** `{user}`",
+        "",
+        "Personal memory and tone should follow this authenticated user. Shared Milde household, Homelab, Home Assistant, Proxmox, Vaultwarden-support, and troubleshooting facts remain global/shared.",
+    ]
+    if user == "jacky":
+        lines.extend([
+            "",
+            "For Jacky: answer in German with short, concrete, low-jargon steps. Prefer safe troubleshooting actions, clear next buttons/places to click, and concise escalation notes for Philipp when deeper admin work is needed.",
+        ])
+    elif user == "philipp":
+        lines.extend([
+            "",
+            "For Philipp: German/du, structured technical detail, risks, best-practice vs pragmatic options, security/backup/update notes, and clear implementation steps are welcome.",
+        ])
+    return "\n".join(lines)
 
-    The session context (connected platforms, delivery hints) is injected
-    via ``_webui_ephemeral_system_prompt`` / ``ephemeral_system_prompt``
-    instead of as a prefill ``user`` message.  Adding it as a user message
-    creates two consecutive user turns (prefill + actual) which strict chat
-    templates (Mistral, Gemma) reject with a Jinja 500.
+
+def _prefill_messages_with_webui_context(
+    prefill_context: dict,
+    config_data: Optional[dict] = None,
+    owner: str | None = None,
+) -> list[dict]:
+    """Return recall prefill messages only.
+
+    WebUI session/delivery context and household-user identity guidance are
+    injected via ``_webui_ephemeral_system_prompt`` instead of appending extra
+    ``user`` messages.  Adding synthetic user turns can create consecutive user
+    messages and break strict chat templates (Mistral, Gemma).
     """
     return list(prefill_context.get("messages") or [])
 
@@ -6628,8 +6660,9 @@ def _run_agent_streaming(
             except Exception:
                 from api.config import get_config as _get_config
                 _cfg = _get_config()
+            _webui_owner = str(getattr(s, 'owner', '') or '').strip().lower() or None
             _prefill_context = _load_webui_prefill_context(_cfg)
-            _prefill_messages = _prefill_messages_with_webui_context(_prefill_context, _cfg)
+            _prefill_messages = _prefill_messages_with_webui_context(_prefill_context, _cfg, owner=_webui_owner)
             _prefill_messages = _normalize_prefill_messages_before_user_turn(_prefill_messages)
             _main_request_overrides = _main_model_request_overrides(_cfg)
             put('context_status', {
@@ -6824,6 +6857,17 @@ def _run_agent_streaming(
                 _agent_kwargs['acp_args'] = _rt.get('args')
             if 'credential_pool' in _agent_params:
                 _agent_kwargs['credential_pool'] = _rt.get('credential_pool')
+            # Thread authenticated WebUI username through to memory providers
+            # such as Honcho. This keeps Jacky's personal memory/profile from
+            # being mixed with Philipp's while still sharing the same Hermes home.
+            if _webui_owner:
+                if 'user_id' in _agent_params:
+                    _agent_kwargs['user_id'] = f'webui:{_webui_owner}'
+                if 'user_id_alt' in _agent_params:
+                    _agent_kwargs['user_id_alt'] = _webui_owner
+                if 'user_name' in _agent_params:
+                    _agent_kwargs['user_name'] = _webui_owner
+
             # Pin Honcho memory sessions to the stable WebUI session ID.
             # Without this, 'per-session' Honcho strategy creates a new Honcho
             # session on every streaming request because HonchoSessionManager is
@@ -6858,6 +6902,7 @@ def _run_agent_streaming(
                     _reasoning_config or {},
                     _main_request_overrides or {},
                     _public_prefill_context_status(_prefill_context),
+                    _webui_owner or '',
                     # #1897: profile_home is part of the agent's identity because
                     # AIAgent caches `_cached_system_prompt` from `load_soul_md()`
                     # at construction time, sourced from HERMES_HOME. Same-session
@@ -7075,6 +7120,7 @@ def _run_agent_streaming(
                     'workspace': s.workspace,
                 },
                 config_data=_cfg,
+                owner=_webui_owner,
             )
             _pending_started_at = getattr(s, 'pending_started_at', None)
             # Normal chat-start sets pending_started_at before spawning this thread;

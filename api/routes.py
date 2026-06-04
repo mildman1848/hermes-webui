@@ -459,6 +459,41 @@ def _session_visible_to_active_profile(session_profile, handler=None) -> bool:
     return _profiles_match(session_profile, active_profile)
 
 
+def _current_webui_user(handler) -> str | None:
+    try:
+        from api.auth import current_username, is_multi_user_auth_enabled
+        if not is_multi_user_auth_enabled():
+            return None
+        return current_username(handler)
+    except Exception:
+        return None
+
+
+def _session_owner_value(session_or_dict) -> str:
+    if isinstance(session_or_dict, dict):
+        owner = session_or_dict.get('owner')
+    else:
+        owner = getattr(session_or_dict, 'owner', None)
+    return str(owner or os.getenv('HERMES_WEBUI_DEFAULT_USER', 'philipp')).strip().lower() or 'philipp'
+
+
+def _session_visible_to_current_user(handler, session_or_dict) -> bool:
+    user = _current_webui_user(handler)
+    if not user:
+        return True
+    return _session_owner_value(session_or_dict) == user
+
+
+def _filter_sessions_for_user(sessions: list[dict], user: str | None) -> list[dict]:
+    if not user:
+        return sessions
+    return [s for s in sessions if _session_owner_value(s) == user]
+
+
+def _filter_sessions_for_current_user(handler, sessions: list[dict]) -> list[dict]:
+    return _filter_sessions_for_user(sessions, _current_webui_user(handler))
+
+
 def _active_skills_dir() -> Path:
     """Return the skills directory for the request's active Hermes profile.
 
@@ -1580,6 +1615,7 @@ def _session_list_cache_key(
     show_previous_messaging_sessions: bool,
     show_cron_sessions: bool,
     source_filter: str | None = None,
+    current_user: str | None = None,
 ) -> tuple:
     return (
         _session_list_cache_profile_scope(active_profile),
@@ -1588,6 +1624,7 @@ def _session_list_cache_key(
         bool(show_previous_messaging_sessions),
         bool(show_cron_sessions),
         source_filter,
+        str(current_user or "").strip().lower(),
     )
 
 
@@ -1791,6 +1828,7 @@ def _build_session_list_cache_payload(
     show_previous_messaging_sessions: bool,
     show_cron_sessions: bool,
     source_filter: str | None = None,
+    current_user: str | None = None,
     diag=None,
 ) -> dict:
     diag_stage = diag.stage if diag is not None else lambda *_a, **_k: None
@@ -1900,7 +1938,7 @@ def _build_session_list_cache_payload(
         webui_sessions = [s for s in webui_sessions if not _is_cli_session_for_settings(s)]
         deduped_cli = []
     diag_stage("sort_sessions")
-    merged = webui_sessions + deduped_cli
+    merged = _filter_sessions_for_user(webui_sessions + deduped_cli, current_user)
     merged.sort(
         key=lambda s: s.get("last_message_at") or s.get("updated_at", 0) or 0,
         reverse=True,
@@ -5651,7 +5689,8 @@ button:hover{background:rgba(124,185,255,.25)}
   <h1>{{BOT_NAME}}</h1>
   <p class="sub">{{LOGIN_SUBTITLE}}</p>
   <form id="login-form" data-invalid-pw="{{LOGIN_INVALID_PW}}" data-conn-failed="{{LOGIN_CONN_FAILED}}">
-    <input type="password" id="pw" placeholder="{{LOGIN_PLACEHOLDER}}" autofocus>
+    <input type="text" id="username" placeholder="Benutzername" autocomplete="username" autofocus>
+    <input type="password" id="pw" placeholder="{{LOGIN_PLACEHOLDER}}" autocomplete="current-password">
     <button type="submit">{{LOGIN_BTN}}</button>
     <button type="button" id="passkey-login" class="passkey-login" style="display:none">Sign in with passkey</button>
   </form>
@@ -7180,7 +7219,7 @@ def handle_get(handler, parsed) -> bool:
         return t(handler, _page, content_type="text/html; charset=utf-8")
 
     if parsed.path == "/api/auth/status":
-        from api.auth import _passkey_feature_flag_enabled, get_password_hash, is_auth_enabled, parse_cookie, verify_session
+        from api.auth import _passkey_feature_flag_enabled, get_password_hash, is_auth_enabled, parse_cookie, verify_session, current_username, configured_usernames, is_multi_user_auth_enabled
         from api.passkeys import registered_credentials
 
         logged_in = False
@@ -7194,6 +7233,9 @@ def handle_get(handler, parsed) -> bool:
         return j(handler, {
             "auth_enabled": auth_enabled,
             "logged_in": logged_in,
+            "username": current_username(handler) if logged_in else None,
+            "multi_user_enabled": is_multi_user_auth_enabled(),
+            "users": configured_usernames() if is_multi_user_auth_enabled() else [],
             "password_auth_enabled": password_auth_enabled,
             "passwordless_enabled": bool(passkeys) and not password_auth_enabled,
             "passkeys_enabled": bool(passkeys),
@@ -7552,6 +7594,8 @@ def handle_get(handler, parsed) -> bool:
             s = get_session(sid, metadata_only=(not load_messages))
             _session_profile = getattr(s, 'profile', None) or None
             if not _session_visible_to_active_profile(_session_profile, handler):
+                return bad(handler, "Session not found", 404)
+            if not _session_visible_to_current_user(handler, s):
                 return bad(handler, "Session not found", 404)
             original_stream_id = getattr(s, "active_stream_id", None)
             _clear_stale_stream_state(s)
@@ -7972,6 +8016,7 @@ def handle_get(handler, parsed) -> bool:
             agent_session_source_filter = settings.get("agent_session_source_filter")
             active_profile = get_active_profile_name()
             all_profiles = _all_profiles_query_flag(parsed)
+            current_user = _current_webui_user(handler)
             key = _session_list_cache_key(
                 active_profile=active_profile,
                 all_profiles=all_profiles,
@@ -7979,6 +8024,7 @@ def handle_get(handler, parsed) -> bool:
                 show_previous_messaging_sessions=show_previous_messaging_sessions,
                 show_cron_sessions=show_cron_sessions,
                 source_filter=agent_session_source_filter,
+                current_user=current_user,
             )
             # Keep the visible /api/sessions contract unchanged even though the
             # heavy lifting now lives in the cache builder: profile scoping via
@@ -7993,6 +8039,7 @@ def handle_get(handler, parsed) -> bool:
                     show_previous_messaging_sessions=show_previous_messaging_sessions,
                     show_cron_sessions=show_cron_sessions,
                     source_filter=agent_session_source_filter,
+                    current_user=current_user,
                     diag=diag,
                 ),
                 diag=diag,
@@ -8807,6 +8854,7 @@ def handle_post(handler, parsed) -> bool:
             project_id=body.get("project_id") or None,
             worktree_info=worktree_info,
             enabled_toolsets=enabled_toolsets,
+            owner=_current_webui_user(handler),
         )
         if worktree_info:
             publish_session_list_changed(
@@ -8825,6 +8873,8 @@ def handle_post(handler, parsed) -> bool:
             session = Session.load(sid)
             if not session:
                 # 404, not 400 — missing resource, not a malformed request.
+                return bad(handler, "Session not found", status=404)
+            if not _session_visible_to_current_user(handler, session):
                 return bad(handler, "Session not found", status=404)
 
             # Deep-copy mutable lists so the duplicate is *actually* independent.
@@ -8883,6 +8933,7 @@ def handle_post(handler, parsed) -> bool:
                 context_engine_state=copy.deepcopy(getattr(session, "context_engine_state", None) or {}),
                 created_at=time.time(),
                 updated_at=time.time(),
+                owner=_current_webui_user(handler),
             )
 
             with LOCK:
@@ -8890,10 +8941,7 @@ def handle_post(handler, parsed) -> bool:
                 SESSIONS.move_to_end(copied_session.session_id)
                 while len(SESSIONS) > SESSIONS_MAX:
                     SESSIONS.popitem(last=False)
-            # Persist immediately. The pre-PR flow (/api/session/new + /api/session/rename)
-            # accidentally avoided this because `/api/session/rename` calls `s.save()`.
-            # Without this explicit save, the duplicate is in-memory only — if the user
-            # refreshes before sending a turn, the duplicate vanishes.
+            # Persist immediately so the duplicate survives refresh before the next turn.
             copied_session.save()
             publish_session_list_changed(
                 "session_duplicate",
@@ -9031,6 +9079,8 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Session not found", 404)
         except PermissionError:
             return bad(handler, "Read-only imported sessions cannot be renamed from WebUI", 403)
+        if not _session_visible_to_current_user(handler, s):
+            return bad(handler, "Session not found", 404)
         with _get_session_agent_lock(body["session_id"]):
             from api.session_ops import apply_session_title_rename
             apply_session_title_rename(s, body["title"])
@@ -9081,6 +9131,8 @@ def handle_post(handler, parsed) -> bool:
             s = get_session(sid)
             s = _ensure_full_session_before_mutation(sid, s)
         except KeyError:
+            return bad(handler, "Session not found", 404)
+        if not _session_visible_to_current_user(handler, s):
             return bad(handler, "Session not found", 404)
         # Resolve personality from config.yaml agent.personalities section
         # (matches hermes-agent CLI behavior)
@@ -9134,6 +9186,8 @@ def handle_post(handler, parsed) -> bool:
             s = get_session(sid)
         except KeyError:
             return bad(handler, "Session not found", 404)
+        if not _session_visible_to_current_user(handler, s):
+            return bad(handler, "Session not found", 404)
         with _get_session_agent_lock(sid):
             s.enabled_toolsets = toolsets
             s.save()
@@ -9151,6 +9205,8 @@ def handle_post(handler, parsed) -> bool:
             try:
                 s = get_session(sid)
             except KeyError:
+                return bad(handler, "Session not found", 404)
+            if not _session_visible_to_current_user(handler, s):
                 return bad(handler, "Session not found", 404)
             draft = getattr(s, "composer_draft", {}) or {}
             return j(handler, {"draft": draft})
@@ -9179,6 +9235,8 @@ def handle_post(handler, parsed) -> bool:
         try:
             s = get_session(sid)
         except KeyError:
+            return bad(handler, "Session not found", 404)
+        if not _session_visible_to_current_user(handler, s):
             return bad(handler, "Session not found", 404)
         unchanged = False
         with _get_session_agent_lock(sid):
@@ -9216,6 +9274,8 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Session not found", 404)
         except PermissionError:
             return bad(handler, "Read-only imported sessions cannot be updated from WebUI", 403)
+        if not _session_visible_to_current_user(handler, s):
+            return bad(handler, "Session not found", 404)
         old_ws = getattr(s, "workspace", "")
         old_model = getattr(s, "model", None)
         old_provider = getattr(s, "model_provider", None)
@@ -9267,6 +9327,8 @@ def handle_post(handler, parsed) -> bool:
             s = get_session(sid, metadata_only=True)
         except KeyError:
             return bad(handler, "Session not found", status=404)
+        if not _session_visible_to_current_user(handler, s):
+            return bad(handler, "Session not found", status=404)
         force = bool(body.get("force", False))
         try:
             from api.worktrees import remove_worktree_for_session
@@ -9285,6 +9347,12 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "session_id is required")
         if not is_safe_session_id(sid):
             return bad(handler, "Invalid session_id", 400)
+        try:
+            _delete_session_for_auth = get_session(sid, metadata_only=True)
+        except KeyError:
+            return bad(handler, "Session not found", 404)
+        if not _session_visible_to_current_user(handler, _delete_session_for_auth):
+            return bad(handler, "Session not found", 404)
         cli_meta_for_delete = _lookup_cli_session_metadata(sid)
         if cli_meta_for_delete.get("read_only"):
             return bad(handler, "Read-only imported sessions cannot be deleted from WebUI", 400)
@@ -9370,6 +9438,8 @@ def handle_post(handler, parsed) -> bool:
             s = get_session(body["session_id"])
         except KeyError:
             return bad(handler, "Session not found", 404)
+        if not _session_visible_to_current_user(handler, s):
+            return bad(handler, "Session not found", 404)
         sid = body["session_id"]
         with _get_session_agent_lock(sid):
             s.messages = []
@@ -9406,6 +9476,8 @@ def handle_post(handler, parsed) -> bool:
         # 3-message session wipes the whole transcript) and then persists it via
         # save(). Mirror the explicit guard the /api/session/branch handler
         # already applies to its own keep_count. (Opus pre-release follow-up.)
+        if not _session_visible_to_current_user(handler, s):
+            return bad(handler, "Session not found", 404)
         try:
             keep = int(body["keep_count"])
         except (ValueError, TypeError):
@@ -9456,6 +9528,8 @@ def handle_post(handler, parsed) -> bool:
         try:
             source = get_session(body["session_id"])
         except KeyError:
+            return bad(handler, "Session not found", 404)
+        if not _session_visible_to_current_user(handler, source):
             return bad(handler, "Session not found", 404)
 
         keep_count = body.get("keep_count")
@@ -9524,6 +9598,7 @@ def handle_post(handler, parsed) -> bool:
             context_engine_state=copy.deepcopy(getattr(source, "context_engine_state", None) or {}),
             parent_session_id=source.session_id,
             session_source="fork",
+            owner=_current_webui_user(handler),
         )
         with LOCK:
             SESSIONS[branch.session_id] = branch
@@ -10570,6 +10645,8 @@ def handle_post(handler, parsed) -> bool:
             create_session,
             set_auth_cookie,
             is_auth_enabled,
+            is_multi_user_auth_enabled,
+            verify_user_password,
         )
         from api.auth import _check_login_rate, _record_login_attempt, _clear_login_attempts
 
@@ -10583,12 +10660,17 @@ def handle_post(handler, parsed) -> bool:
                 status=429,
             )
         password = body.get("password", "")
-        if not verify_password(password):
+        username = None
+        if is_multi_user_auth_enabled():
+            ok, username = verify_user_password(body.get("username") or body.get("user"), password)
+        else:
+            ok = verify_password(password)
+        if not ok:
             _record_login_attempt(client_ip)
-            return bad(handler, "Invalid password", 401)
+            return bad(handler, "Invalid username or password", 401)
         _clear_login_attempts(client_ip)
-        cookie_val = create_session()
-        body = json.dumps({"ok": True}).encode()
+        cookie_val = create_session(username)
+        body = json.dumps({"ok": True, "username": username}).encode()
         handler.send_response(200)
         handler.send_header("Content-Type", "application/json")
         handler.send_header("Content-Length", str(len(body)))
@@ -14802,6 +14884,8 @@ def _handle_chat_start(handler, body, diag=None):
             return bad(handler, "Session not found", 404)
         except PermissionError:
             return bad(handler, "Read-only imported sessions cannot be continued from WebUI", 403)
+        if not _session_visible_to_current_user(handler, s):
+            return bad(handler, "Session not found", 404)
         diag.stage("validate_profile") if diag else None
         requested_profile = str(body.get("profile") or "").strip()
         if requested_profile:
@@ -15001,7 +15085,8 @@ def _handle_chat_sync(handler, body):
                     _api_key = _cp_key
                 if not _base_url and _cp_base:
                     _base_url = _cp_base
-            agent = AIAgent(
+            _sync_owner = str(getattr(s, 'owner', '') or '').strip().lower() or None
+            _sync_agent_kwargs = dict(
                 model=_model,
                 provider=_provider,
                 base_url=_base_url,
@@ -15013,6 +15098,14 @@ def _handle_chat_sync(handler, body):
                 enabled_toolsets=_resolve_cli_toolsets(),
                 session_id=s.session_id,
             )
+            if _sync_owner:
+                _sync_agent_kwargs.update(
+                    user_id=f"webui:{_sync_owner}",
+                    user_id_alt=_sync_owner,
+                    user_name=_sync_owner,
+                    gateway_session_key=s.session_id,
+                )
+            agent = AIAgent(**_sync_agent_kwargs)
             from api.streaming import (
                 _WEBUI_PROGRESS_PROMPT,
                 _dedupe_replayed_context_messages,

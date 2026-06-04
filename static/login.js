@@ -5,6 +5,7 @@
 document.addEventListener('DOMContentLoaded', function () {
   var form = document.getElementById('login-form');
   var input = document.getElementById('pw');
+  var userInput = document.getElementById('username');
   var passkeyBtn = document.getElementById('passkey-login');
 
   if (!form || !input) return;
@@ -44,7 +45,7 @@ document.addEventListener('DOMContentLoaded', function () {
       var res = await fetch('api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password: pw }),
+        body: JSON.stringify({ username: userInput ? userInput.value : '', password: pw }),
         credentials: 'include',
       });
       var data = {};
@@ -143,6 +144,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
     function setFormDisabled(disabled) {
       if (input) input.disabled = disabled;
+      if (userInput) userInput.disabled = disabled;
       var btn = form.querySelector('button');
       if (btn) btn.disabled = disabled;
     }
