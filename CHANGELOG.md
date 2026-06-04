@@ -3,6 +3,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Bounded WebUI memory growth and idle CPU on large installs** (#3506). On a profile with hundreds of sessions and tens of thousands of messages, the WebUI Python process could climb from ~100 MB to ~1.5 GB RSS over several days and hold high CPU while idle. Three root causes were fixed: (1) the `session_lifecycle._sessions` dict grew without bound — entries were created but never removed — so every session id the WebUI ever touched leaked a permanent entry; a new safe `discard_session()` now drops the entry at the agent-eviction boundaries, but only when there is no in-flight commit and no uncommitted memory work (the retry invariant is preserved); (2) the in-memory agent/session cache sizes are now operator-tunable via `HERMES_WEBUI_AGENT_CACHE_MAX` and `HERMES_WEBUI_SESSIONS_MAX`, and the agent-cache default was lowered from 50 to 25 (each cached agent pins a full conversation transcript, so this is the dominant lever on resident memory); (3) the gateway session watcher re-ran an expensive per-session `MAX(messages.timestamp)` aggregation every 5 seconds even when nothing changed — it now first computes a cheap `sessions`-table-only fingerprint (~15× cheaper, measured on a 1.5 GB state.db) and only runs the full projection when that fingerprint actually changes. (@djenttleman reported with detailed profiling)
+
 ## [v0.51.252] — 2026-06-03 — Release HT (stage-q24 — selection-bleed fix + compatibility docs)
 
 ### Fixed

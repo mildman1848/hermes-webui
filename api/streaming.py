@@ -3857,6 +3857,12 @@ def _lifecycle_unregister_agent(session_id: str) -> None:
     unregister_agent(session_id)
 
 
+def _lifecycle_discard_session(session_id: str) -> bool:
+    from api.session_lifecycle import discard_session
+
+    return discard_session(session_id)
+
+
 def _close_evicted_agent_at_session_boundary(session_id: str, agent) -> bool:
     """Commit and tear down an evicted cached agent at a WebUI session boundary.
 
@@ -3876,6 +3882,10 @@ def _close_evicted_agent_at_session_boundary(session_id: str, agent) -> bool:
         _lifecycle_commit_session_memory(session_id, agent=agent, wait=True)
         if not _lifecycle_has_uncommitted_work(session_id):
             _lifecycle_unregister_agent(session_id)
+            # Drop the lifecycle dict entry now that the LRU-evicted agent is
+            # gone and no uncommitted work remains, so the dict tracks only live
+            # sessions instead of growing unbounded (issue #3506).
+            _lifecycle_discard_session(session_id)
         else:
             should_close_evicted_agent = False
     except Exception:
